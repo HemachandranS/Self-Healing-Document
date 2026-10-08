@@ -295,8 +295,11 @@ switch(opt)
 case 1:
 cout<<"\nEnter Room Number: ";
 cin>>rno;
-if(count==0)
-{}
+if (rno < 1 || rno > 10)
+    {
+        cout << "\nInvalid Room Number! Room number must be between 1 and 10 strictly.";
+        getch();
+    }
 else{
 i=0;
 for(i=0;i<count;i++)
