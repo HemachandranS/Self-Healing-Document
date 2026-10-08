@@ -1,8 +1,8 @@
 import os
 import json
+import subprocess
 from dotenv import load_dotenv
 from groq import Groq
-import subprocess
 
 # Load environment variables
 load_dotenv()
@@ -14,23 +14,82 @@ if not GROQ_API_KEY:
 client = Groq(api_key=GROQ_API_KEY)
 
 
+def get_all_pr_commits_and_diffs(base_branch="self_healing_doccumentation"):
+    """
+    Fetches all commits from the feature branch relative to base_branch using git log.
+    Returns:
+        commit_dict: { "Commit Message/Title": "Commit Diff Text", ... }
+        cumulative_diff: Full combined git diff across all PR commits
+    """
+    commit_dict = {}
+    cumulative_diff = ""
+
+    try:
+        # Safeguard: Ensure base branch reference exists locally (especially in CI)
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            base_ref = os.getenv("GITHUB_BASE_REF", base_branch)
+            subprocess.run(["git", "fetch", "origin", f"{base_ref}:{base_ref}"], check=False)
+            base_branch = base_ref
+
+        # 1. Get commit hashes from base_branch to HEAD
+        hashes_output = subprocess.check_output(
+            ["git", "log", f"{base_branch}..new_brranch", "--pretty=format:%H"],
+            text=True
+        ).strip()
+
+        if hashes_output:
+            commit_hashes = hashes_output.splitlines()
+
+            # Iterate through all commit hashes
+            for commit_hash in commit_hashes:
+                # Get commit title / message
+                commit_title = subprocess.check_output(
+                    ["git", "log", "-1", "--pretty=format:%s", commit_hash],
+                    text=True
+                ).strip()
+
+                # Get diff for this specific commit
+                commit_diff = subprocess.check_output(
+                    ["git", "show", commit_hash],
+                    text=True
+                )
+
+                commit_dict[commit_title] = commit_diff
+
+            # 2. Fetch total cumulative diff across the entire PR
+            cumulative_diff = subprocess.check_output(
+                ["git", "diff", f"{base_branch}...HEAD"],
+                text=True
+            )
+        else:
+            # Local fallback if no branch difference is found (e.g. uncommitted/latest local commit)
+            print("⚠️ No commits found relative to base branch. Checking local changes...")
+            commit_title = subprocess.check_output(
+                ["git", "log", "-1", "--pretty=format:%s"], text=True
+            ).strip()
+            commit_diff = subprocess.check_output(["git", "show", "HEAD"], text=True)
+            commit_dict[commit_title] = commit_diff
+            cumulative_diff = commit_diff
+
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Git subprocess error: {e}")
+
+    return commit_dict, cumulative_diff
+
+
 def pack_repo_context(project_root="."):
-    """Pack file tree and existing .md docs into a single string."""
+    """Pack file tree and existing .md docs into a single string context."""
     context = "=== PROJECT FILE STRUCTURE ===\n"
-    
-    # 1. Gather file paths (skipping venv, git, bytecode)
     ignored = {".git", "__pycache__", ".venv", "venv", "node_modules", ".env"}
+
     for root, dirs, files in os.walk(project_root):
         dirs[:] = [d for d in dirs if d not in ignored]
         for file in files:
             rel_path = os.path.relpath(os.path.join(root, file), project_root)
-            print(f"📄 Found file: {rel_path}")
             context += f"- {rel_path}\n"
 
-    # 2. Append existing documentation files
     context += "\n=== EXISTING DOCUMENTATION (.md) ===\n"
     docs_dir = os.path.join(project_root, "docs")
-    
     if os.path.exists(docs_dir):
         for file in os.listdir(docs_dir):
             if file.endswith(".md"):
@@ -42,82 +101,43 @@ def pack_repo_context(project_root="."):
 
     return context
 
-def get_git_diff_latest_commit():
-    """Fetches the diff and commit message from the most recent commit (HEAD~1 to HEAD)."""
-    try:
-        # Get commit message / title
-        pr_title = subprocess.check_output(
-            ["git", "log", "-1", "--pretty=format:%s"],
-            text=True
-        ).strip()
 
-        # Get diff of the latest commit
-        diff_text = subprocess.check_output(
-            ["git", "show", "HEAD"],
-            text=True
-        )
-
-        return pr_title, diff_text
-    except subprocess.CalledProcessError as e:
-        print(f"Error fetching git commit diff: {e}")
-
-def get_all_pr_commits_and_diff():
-    """Extracts all commit messages and the combined diff for the current PR."""
-    try:
-        base_ref = os.getenv("GITHUB_BASE_REF", "main")
-        
-        # 1. Fetch the target base branch to compare against
-        subprocess.run(["git", "fetch", "origin", base_ref], check=True)
-        
-        # 2. Get list of all commit messages included in this PR
-        # Format: [commit hash] Commit Subject - Commit Body
-        commit_logs = subprocess.check_output(
-            ["git", "log", f"origin/{base_ref}..HEAD", "--pretty=format:- %h: %s %b"],
-            text=True
-        ).strip()
-        
-        # 3. Get the complete code diff across all commits in the PR
-        git_diff = subprocess.check_output(
-            ["git", "diff", f"origin/{base_ref}...HEAD"],
-            text=True
-        )
-
-        pr_title = os.getenv("GITHUB_PR_TITLE", "Pull Request Changes")
-        
-        # Combine PR title with all individual commit logs
-        full_context_message = f"PR Title: {pr_title}\n\nAll PR Commits:\n{commit_logs}"
-        
-        return full_context_message, git_diff
-
-    except subprocess.CalledProcessError as e:
-        print(f"Error extracting PR commits: {e}")
-        return "PR Update", ""
-
-
-def heal_documentation(git_diff, pr_title: str, target_doc_path: str):
-    """Analyze code changes and update the target documentation file."""
+def heal_documentation(commit_dict: dict, cumulative_diff: str, target_doc_path: str, pr_title: str = ""):
+    """
+    Analyzes the dictionary of commit titles and diffs to update functional documentation.
+    
+    Args:
+        commit_dict: Dict mapping { "Commit Title": "Commit Diff Text" }
+        cumulative_diff: String containing full diff across all PR commits
+        target_doc_path: Path to the markdown documentation file to update
+        pr_title: Optional title/summary of the PR
+    """
     # Step A: Pack codebase context
     repo_context = pack_repo_context()
 
-    # Step B: Read target doc content
+    # Step B: Read target document content
     if os.path.exists(target_doc_path):
         with open(target_doc_path, "r", encoding="utf-8") as f:
             current_doc_text = f.read()
     else:
         current_doc_text = "# Functional Requirements\nNo document exists yet."
 
-    # Step C: Prompt Groq openai/gpt-oss-120b
-    system_prompt = """You are an AI Self-Healing Documentation Engine for a software project.
-Your job is to analyze functional/business-logic changes in a git diff and update the Markdown documentation.
+    # Step C: Format commit dictionary into structured prompt context
+    formatted_commits_text = ""
+    for idx, (title, diff_text) in enumerate(commit_dict.items(), 1):
+        formatted_commits_text += f"\n--- COMMIT #{idx}: {title} ---\n{diff_text}\n"
+
+    # Step D: System and User Prompts
+    system_prompt = """You are an AI Self-Healing Documentation Engine for a software repository.
+Your goal is to analyze functional and business-logic changes across PR commits and update the Markdown documentation.
 
 RULES:
-1. Identify changes to business rules, system behavior, default values, or edge cases.
-2. Update the functional explanations in the documentation to match the new code behavior.
-3. DO NOT just write code syntax descriptions (avoid phrases like 'line 12 added an if statement').
-4. Focus on functional impact (e.g., 'Cancellation policy changed from 24h to 48h prior to check-in').
-5. Output ONLY valid JSON matching this schema:
+1. Understand the developer's intent from the commit messages and code changes across all PR commits.
+2. Update functional rules, system behavior, business logic, default values, or edge cases in the documentation.
+3. DO NOT write line-by-line syntax commentary (avoid 'added an if statement on line 10'). Focus on functional impact.
+4. Output ONLY valid JSON with this exact structure:
 {
-  "functional_summary": "1-2 sentence summary of business rule changes",
+  "functional_summary": "1-2 sentence executive summary of business/functional rule changes",
   "updated_markdown": "Complete updated Markdown documentation text"
 }"""
 
@@ -128,17 +148,21 @@ RULES:
 === TARGET DOCUMENTATION FILE ({target_doc_path}) ===
 {current_doc_text}
 
-=== CODE CHANGE (GIT DIFF) ===
-PR Title: {pr_title}
-commit title: {git_diff[0]}
-Diff:
-{git_diff[1]}
+=== PR OVERVIEW ===
+PR Title: {pr_title if pr_title else 'Pull Request Updates'}
+Total Commits Analyzed: {len(commit_dict)}
+
+=== INDIVIDUAL COMMITS (DEVELOPER INTENT & DIFFS) ===
+{formatted_commits_text}
+
+=== FULL CUMULATIVE PR CODE DIFF ===
+{cumulative_diff}
 
 Generate the updated Markdown documentation in JSON format.
 """
 
-    print("⚡ Sending request to Groq (openai/gpt-oss-120b)...")
-    
+    print(f"⚡ Sending {len(commit_dict)} commit(s) to Groq (openai/gpt-oss-120b)...")
+
     response = client.chat.completions.create(
         model="openai/gpt-oss-120b",
         messages=[
@@ -153,7 +177,7 @@ Generate the updated Markdown documentation in JSON format.
     print("\n✅ --- FUNCTIONAL CHANGES DETECTED ---")
     print(result.get("functional_summary"))
 
-    # Step D: Overwrite/Update the target doc
+    # Step E: Overwrite/Update the documentation file
     os.makedirs(os.path.dirname(target_doc_path), exist_ok=True)
     with open(target_doc_path, "w", encoding="utf-8") as f:
         f.write(result.get("updated_markdown"))
@@ -162,18 +186,18 @@ Generate the updated Markdown documentation in JSON format.
 
 
 if __name__ == "__main__":
-    # Test Run with a sample Hotel Management diff
-    sample_pr_title = "feat(booking): Update cancellation rules and add late checkout fee"
-    
-    sample_diff = get_all_pr_commits_and_diff()
+    # Fetch commit dict and cumulative diff for the feature branch
+    pr_commits, full_diff = get_all_pr_commits_and_diffs(base_branch="self_healing_doccumentation")
 
-    print(sample_diff)
+    if pr_commits:
+        doc_file = "docs/booking_policy.md"
+        pr_title_env = os.getenv("GITHUB_PR_TITLE", "PR Updates")
 
-    # Target doc file to self-heal
-    doc_file = "docs/booking_policy.md"
-
-    heal_documentation(
-        git_diff=sample_diff,
-        pr_title=sample_pr_title,
-        target_doc_path=doc_file
-    )
+        heal_documentation(
+            commit_dict=pr_commits,
+            cumulative_diff=full_diff,
+            target_doc_path=doc_file,
+            pr_title=pr_title_env
+        )
+    else:
+        print("No commit differences detected between feature branch and base branch.")
